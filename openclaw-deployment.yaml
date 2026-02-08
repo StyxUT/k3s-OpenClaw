@@ -1,0 +1,318 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openclaw-gateway
+  namespace: openclaw
+  labels:
+    app: openclaw-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openclaw-gateway
+  template:
+    metadata:
+      labels:
+        app: openclaw-gateway
+    spec:
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+        - name: fix-openclaw-perms
+          image: alpine/openclaw:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          command:
+            - sh
+            - -lc
+            - |
+              set -eu
+
+              STATE_DIR="/home/node/.openclaw"
+
+              # Ensure the main container user can read/write its state.
+              chown -R 1000:1000 "$STATE_DIR" 2>/dev/null || true
+
+              # Best-effort hardening; keep idempotent and non-fatal.
+              chmod 0700 "$STATE_DIR" 2>/dev/null || true
+              chmod 0600 "$STATE_DIR/openclaw.json" 2>/dev/null || true
+              chmod 0700 "$STATE_DIR/credentials" 2>/dev/null || true
+              chmod 0600 "$STATE_DIR/agents/main/agent/auth-profiles.json" 2>/dev/null || true
+          volumeMounts:
+            - name: k8s-pv02-openclaw
+              mountPath: /home/node/.openclaw
+              subPath: openclaw/data/.openclaw
+        - name: seed-openclaw-config
+          image: alpine/openclaw:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -lc
+            - |
+              set -eu
+              CONFIG_PATH="/home/node/.openclaw/openclaw.json"
+              if [ ! -f "$CONFIG_PATH" ]; then
+                cp /bootstrap/openclaw.json "$CONFIG_PATH"
+              fi
+          volumeMounts:
+            - name: k8s-pv02-openclaw
+              mountPath: /home/node/.openclaw
+              subPath: openclaw/data/.openclaw
+            - name: openclaw-config
+              mountPath: /bootstrap/openclaw.json
+              subPath: openclaw.json
+              readOnly: true
+        - name: enforce-openclaw-security
+          image: alpine/openclaw:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+          env:
+            - name: HOME
+              value: /home/node
+            - name: OPENCLAW_CONFIG_PATH
+              value: /home/node/.openclaw/openclaw.json
+            - name: TERM
+              value: xterm-256color
+          command:
+            - sh
+            - -lc
+            - |
+              set -eu
+
+              # Enforce security-critical config on every start.
+              node dist/index.js config set --json gateway.controlUi.allowInsecureAuth false
+              node dist/index.js config set --json gateway.controlUi.enabled true
+              node dist/index.js config set --json gateway.controlUi.allowedOrigins '["https://openclaw.styxut.net"]'
+              node dist/index.js config set --json gateway.trustedProxies '["127.0.0.1/32","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10"]'
+              node dist/index.js config set --json agents.defaults.sandbox.mode '"off"'
+              node dist/index.js config set --json tools.deny '["group:web","browser"]'
+              node dist/index.js config set --json tools.elevated.allowFrom.telegram '["8371946443"]'
+              node dist/index.js config unset tools.elevated.allowFrom.webchat || true
+              node dist/index.js config unset tools.web || true
+          volumeMounts:
+            - name: k8s-pv02-openclaw
+              mountPath: /home/node/.openclaw
+              subPath: openclaw/data/.openclaw
+        - name: install-gh
+          image: alpine/openclaw:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -lc
+            - |
+              set -eu
+
+              BIN_DIR="/home/node/.openclaw/bin"
+              GH_BIN="$BIN_DIR/gh"
+
+              if [ -x "$GH_BIN" ]; then
+                exit 0
+              fi
+
+              mkdir -p "$BIN_DIR"
+
+              tmpdir="$(mktemp -d)"
+              trap 'rm -rf "$tmpdir"' EXIT
+
+              version="${GH_VERSION:-}"
+              if [ -z "$version" ]; then
+                version="$(
+                  curl -fsSL \
+                    -H "Authorization: Bearer ${GH_TOKEN:-}" \
+                    -H "X-GitHub-Api-Version: 2022-11-28" \
+                    -H "Accept: application/vnd.github+json" \
+                    https://api.github.com/repos/cli/cli/releases/latest \
+                  | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const t=JSON.parse(s).tag_name||"";process.stdout.write(t.replace(/^v/,""))})'
+                )" || true
+              fi
+
+              # Fallback pin so init doesn't fail on GitHub API/rate-limit issues.
+              version="${version:-2.57.0}"
+
+              if ! curl -fsSL \
+                -o "$tmpdir/gh.tgz" \
+                "https://github.com/cli/cli/releases/download/v${version}/gh_${version}_linux_amd64.tar.gz"; then
+                echo "WARN: failed to download gh ${version}; continuing without gh" >&2
+                exit 0
+              fi
+
+              tar -xzf "$tmpdir/gh.tgz" -C "$tmpdir"
+              mv "$tmpdir/gh_${version}_linux_amd64/bin/gh" "$GH_BIN"
+              chmod 0755 "$GH_BIN"
+          env:
+            - name: GH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: openclaw-github
+                  key: token
+            - name: GH_VERSION
+              value: "2.57.0"
+          volumeMounts:
+            - name: k8s-pv02-openclaw
+              mountPath: /home/node/.openclaw
+              subPath: openclaw/data/.openclaw
+        - name: install-gog
+          image: alpine/openclaw:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -lc
+            - |
+              set -eu
+
+              BIN_DIR="/home/node/.openclaw/bin"
+              GOG_BIN="$BIN_DIR/gog"
+
+              if [ -x "$GOG_BIN" ]; then
+                exit 0
+              fi
+
+              mkdir -p "$BIN_DIR"
+
+              tmpdir="$(mktemp -d)"
+              trap 'rm -rf "$tmpdir"' EXIT
+
+              arch="$(uname -m)"
+              case "$arch" in
+                x86_64|amd64) arch="amd64" ;;
+                aarch64|arm64) arch="arm64" ;;
+                *)
+                  echo "Unsupported architecture: $arch" >&2
+                  exit 1
+                  ;;
+              esac
+
+              # Pinned version to avoid GitHub API auth/rate-limit issues in init.
+              version="${GOGCLI_VERSION:-0.9.0}"
+
+              curl -fsSL \
+                -o "$tmpdir/gog.tgz" \
+                "https://github.com/steipete/gogcli/releases/download/v${version}/gogcli_${version}_linux_${arch}.tar.gz"
+
+              tar -xzf "$tmpdir/gog.tgz" -C "$tmpdir"
+              mv "$tmpdir/gog" "$GOG_BIN"
+              chmod 0755 "$GOG_BIN"
+          volumeMounts:
+            - name: k8s-pv02-openclaw
+              mountPath: /home/node/.openclaw
+              subPath: openclaw/data/.openclaw
+      containers:
+        - name: openclaw-gateway
+          #image: docker.io/styxut/openclaw-gateway:latest
+          image: alpine/openclaw:latest
+          imagePullPolicy: IfNotPresent
+          command: ["node", "dist/index.js", "gateway", "--allow-unconfigured", "--bind", "lan", "--port", "18789"]
+          ports:
+            - name: http
+              containerPort: 18789
+          env:
+            - name: HOME
+              value: /home/node
+            - name: XDG_CONFIG_HOME
+              value: /home/node/.openclaw/xdg-config
+            - name: XDG_DATA_HOME
+              value: /home/node/.openclaw/xdg-data
+            - name: PATH
+              value: /home/node/.openclaw/bin:/usr/local/bin:/usr/bin:/bin
+            - name: TERM
+              value: xterm-256color
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: openclaw-github
+                  key: token
+            - name: GH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: openclaw-github
+                  key: token
+            - name: TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: openclaw-telegram
+                  key: token
+            - name: GOG_ACCOUNT
+              valueFrom:
+                secretKeyRef:
+                  name: openclaw-gog
+                  key: account
+            - name: GOG_KEYRING_BACKEND
+              value: file
+            - name: GOG_KEYRING_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: openclaw-gog
+                  key: keyring_password
+            - name: OPENCLAW_CONFIG_PATH
+              value: /home/node/.openclaw/openclaw.json
+            - name: OPENCLAW_GATEWAY_BIND
+              value: "lan"
+            - name: OPENCLAW_GATEWAY_PORT
+              value: "18789"
+            - name: OPENCLAW_GATEWAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: openclaw-secrets
+                  key: gateway_token
+            - name: GOG_HOME
+              value: /home/node/.openclaw/gog
+          volumeMounts:
+            - name: k8s-pv02-openclaw
+              mountPath: /home/node/.openclaw
+              subPath: openclaw/data/.openclaw
+            - name: openclaw-config
+              mountPath: /bootstrap/openclaw.json
+              subPath: openclaw.json
+              readOnly: true
+            - name: k8s-pv02-openclaw
+              mountPath: /home/node/.openclaw/workspace
+              subPath: openclaw/data/openclaw/workspace
+            - name: k8s-pv02-openclaw
+              mountPath: /usr/local/bin/gh
+              subPath: openclaw/data/.openclaw/bin/gh
+              readOnly: true
+            - name: k8s-pv02-openclaw
+              mountPath: /usr/local/bin/gog
+              subPath: openclaw/data/.openclaw/bin/gog
+              readOnly: true
+            - name: gog-credentials
+              mountPath: /home/node/.openclaw/gog/credentials.json
+              subPath: credentials.json
+              readOnly: true
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+      volumes:
+        - name: k8s-pv02-openclaw
+          persistentVolumeClaim:
+            claimName: synology-k8s-pv02-openclaw
+        - name: openclaw-config
+          configMap:
+            name: openclaw-config
+        - name: gog-credentials
+          secret:
+            secretName: openclaw-gog
+            items:
+              - key: credentials.json
+                path: credentials.json

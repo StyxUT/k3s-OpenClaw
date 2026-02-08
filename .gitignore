@@ -1,0 +1,11 @@
+# Real secrets (never commit)
+openclaw-secret.yaml
+openclaw-gog-secret.yaml
+openclaw-github-secret.yaml
+openclaw-telegram-secret.yaml
+
+# Also ignore common backup/copy variants
+openclaw-*-secret.yaml.*
+
+# Optional local overlays
+*.local.yaml
