@@ -8,6 +8,8 @@ metadata:
     app: openclaw-gateway
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: openclaw-gateway
@@ -32,9 +34,13 @@ spec:
               set -eu
 
               STATE_DIR="/home/node/.openclaw"
+              WORKSPACE_DIR="$STATE_DIR/workspace"
 
               # Ensure the main container user can read/write its state.
               chown -R 1000:1000 "$STATE_DIR" 2>/dev/null || true
+
+              # Ensure the main container user can read/write its workspace.
+              chown -R 1000:1000 "$WORKSPACE_DIR" 2>/dev/null || true
 
               # Best-effort hardening; keep idempotent and non-fatal.
               chmod 0700 "$STATE_DIR" 2>/dev/null || true
@@ -45,6 +51,9 @@ spec:
             - name: k8s-pv02-openclaw
               mountPath: /home/node/.openclaw
               subPath: openclaw/data/.openclaw
+            - name: k8s-pv02-openclaw
+              mountPath: /home/node/.openclaw/workspace
+              subPath: openclaw/data/openclaw/workspace
         - name: seed-openclaw-config
           image: alpine/openclaw:latest
           imagePullPolicy: IfNotPresent
@@ -89,15 +98,77 @@ spec:
               node dist/index.js config set --json gateway.controlUi.enabled true
               node dist/index.js config set --json gateway.controlUi.allowedOrigins '["https://openclaw.styxut.net"]'
               node dist/index.js config set --json gateway.trustedProxies '["127.0.0.1/32","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10"]'
+
+              # Tool calling requires the Responses API shape.
+              node dist/index.js config set --json models.providers.ollama.api '"openai-responses"'
+
               node dist/index.js config set --json agents.defaults.sandbox.mode '"off"'
-              node dist/index.js config set --json tools.deny '["group:web","browser"]'
+              node dist/index.js config set --json tools.deny '[]'
+              node dist/index.js config set --json browser.attachOnly true
+              node dist/index.js config set --json browser.defaultProfile '"pod"'
+              node dist/index.js config set --json browser.headless true
+              node dist/index.js config set --json browser.profiles.pod '{"cdpUrl":"http://127.0.0.1:9222","color":"#FF4500"}'
+
+              # Ensure the agent can actually use the browser tool (tools.allow is an allowlist).
+              ALLOW_JSON="$(node -e 'const fs=require("fs");const p=process.env.OPENCLAW_CONFIG_PATH||"/home/node/.openclaw/openclaw.json";const cfg=JSON.parse(fs.readFileSync(p,"utf8"));const a=cfg&&cfg.tools&&cfg.tools.allow; if(!Array.isArray(a)){process.stdout.write("null");process.exit(0);} const next=[...new Set([...a,"browser"])]; process.stdout.write(JSON.stringify(next));')"
+              if [ "$ALLOW_JSON" != "null" ]; then
+                node dist/index.js config set --json tools.allow "$ALLOW_JSON"
+              fi
+
               node dist/index.js config set --json tools.elevated.allowFrom.telegram '["8371946443"]'
               node dist/index.js config unset tools.elevated.allowFrom.webchat || true
               node dist/index.js config unset tools.web || true
+
+              # The agent's system prompt includes workspace docs (e.g. AGENTS.md/TOOLS.md).
+              # Patch them to reflect that core tools (like `browser`) are provided by the gateway,
+              # not by files under workspace/skills.
+              node -e '
+                const fs = require("fs");
+                const path = require("path");
+                const ws = "/home/node/.openclaw/workspace";
+                function prependIfMissing(file, marker, block) {
+                  const p = path.join(ws, file);
+                  if (!fs.existsSync(p)) return;
+                  const cur = fs.readFileSync(p, "utf8");
+                  if (cur.includes(marker)) return;
+                  fs.writeFileSync(p, block + "\n" + cur, "utf8");
+                }
+                function replaceIfPresent(file, needle, replacement) {
+                  const p = path.join(ws, file);
+                  if (!fs.existsSync(p)) return;
+                  const cur = fs.readFileSync(p, "utf8");
+                  if (!cur.includes(needle)) return;
+                  fs.writeFileSync(p, cur.replace(needle, replacement), "utf8");
+                }
+                prependIfMissing(
+                  "TOOLS.md",
+                  "Deployment Tool Notes (Kubernetes)",
+                  [
+                    "# Deployment Tool Notes (Kubernetes)",
+                    "",
+                    "Tools are exposed by the OpenClaw gateway and controlled by `tools.allow`/`tools.deny` in config.",
+                    "Do not assume tools come from `workspace/skills`.",
+                    "",
+                    "In this cluster deployment:",
+                    "- The built-in `browser` tool is available.",
+                    "- It attaches to the headless Chromium sidecar via CDP at `http://127.0.0.1:9222`.",
+                    "",
+                    "---",
+                  ].join("\n")
+                );
+                replaceIfPresent(
+                  "AGENTS.md",
+                  "Skills provide your tools. When you need one, check its `SKILL.md`. Keep local notes (camera names, SSH details, voice preferences) in `TOOLS.md`.",
+                  "Tools are exposed by the OpenClaw gateway (see config `tools.allow`/`tools.deny`). Skills may add extra capabilities, but core tools like `exec` and `browser` are built-in. Keep local notes (camera names, SSH details, voice preferences) in `TOOLS.md`."
+                );
+              '
           volumeMounts:
             - name: k8s-pv02-openclaw
               mountPath: /home/node/.openclaw
               subPath: openclaw/data/.openclaw
+            - name: k8s-pv02-openclaw
+              mountPath: /home/node/.openclaw/workspace
+              subPath: openclaw/data/openclaw/workspace
         - name: install-gh
           image: alpine/openclaw:latest
           imagePullPolicy: IfNotPresent
@@ -202,6 +273,37 @@ spec:
               mountPath: /home/node/.openclaw
               subPath: openclaw/data/.openclaw
       containers:
+        - name: chromium
+          image: chromedp/headless-shell:stable
+          imagePullPolicy: IfNotPresent
+          command: ["headless-shell"]
+          args:
+            - --remote-debugging-address=0.0.0.0
+            - --remote-debugging-port=9222
+            - --no-sandbox
+            - --disable-setuid-sandbox
+            - --disable-gpu
+            - --user-data-dir=/data
+            - about:blank
+          ports:
+            - name: cdp
+              containerPort: 9222
+          readinessProbe:
+            exec:
+              command:
+                - bash
+                - -lc
+                - 'exec 3<>/dev/tcp/127.0.0.1/9222; printf "GET /json/version HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3; IFS= read -r -t 0.8 status <&3; [[ "$status" == *" 200 "* ]]'
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 12
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: k8s-pv02-openclaw
+              mountPath: /data
+              subPath: openclaw/data/chromium/user-data
         - name: openclaw-gateway
           #image: docker.io/styxut/openclaw-gateway:latest
           image: alpine/openclaw:latest
@@ -307,6 +409,10 @@ spec:
         - name: k8s-pv02-openclaw
           persistentVolumeClaim:
             claimName: synology-k8s-pv02-openclaw
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
         - name: openclaw-config
           configMap:
             name: openclaw-config
