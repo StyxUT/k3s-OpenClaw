@@ -5,7 +5,7 @@ openclaw-github-secret.yaml
 openclaw-telegram-secret.yaml
 
 # Also ignore common backup/copy variants
-openclaw-*-secret.yaml.*
+openclaw-*-secret.yaml
 
 # Optional local overlays
 *.local.yaml
