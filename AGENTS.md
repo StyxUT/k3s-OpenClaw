@@ -12,6 +12,7 @@ Contents (today):
 - `openclaw-github-secret.yaml.example` (Secret template: GitHub token)
 - `openclaw-telegram-secret.yaml.example` (Secret template: Telegram bot token)
 - `docs/gmail-gog.md` (How to configure Gmail via `gog` skill)
+- `docs/control-ui.md` (How to pair the Control UI when using a new browser)
 - `docs/secrets.md` (How secrets are managed and stored)
 - `docs/storage.md` (PV/PVC and NFS binding notes)
 
