@@ -9,6 +9,18 @@ metadata:
 data:
   openclaw.json: |
     {
+      "browser": {
+        "enabled": true,
+        "defaultProfile": "pod",
+        "headless": true,
+        "attachOnly": true,
+        "profiles": {
+          "pod": {
+            "cdpUrl": "http://127.0.0.1:9222",
+            "color": "#FF4500"
+          }
+        }
+      },
       "gateway": {
         "mode": "local",
         "bind": "lan",
@@ -81,12 +93,10 @@ data:
       "tools": {
         "profile": "coding",
         "allow": [
-          "exec"
-        ],
-        "deny": [
-          "group:web",
+          "exec",
           "browser"
         ],
+        "deny": [],
         "elevated": {
           "enabled": true,
           "allowFrom": {
